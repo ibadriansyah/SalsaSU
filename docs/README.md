@@ -37,7 +37,7 @@
 
 ## ✅ Compatibility
 
-KernelSU Next supports Android kernels from **4.4 up to 6.12**.
+SalsaSU supports Android kernels from **4.4 up to 6.12**.
 
 | Kernel version       | Support notes                                                           |
 |----------------------|-------------------------------------------------------------------------|
