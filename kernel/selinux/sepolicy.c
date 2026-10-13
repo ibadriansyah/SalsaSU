@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/sizes.h>
 
 #include "sepolicy.h"
 #include "klog.h" // IWYU pragma: keep
@@ -93,8 +94,7 @@ static bool add_typeattribute(struct policydb *db, const char *type,
 #define symtab_insert(s, name, datum) hashtab_insert((s)->table, name, datum)
 #endif
 
-#define avtab_for_each(avtab, cur)                                             \
-    ksu_hash_for_each(avtab.htable, avtab.nslot, cur);
+#define avtab_for_each(avtab, cur) ksu_hash_for_each(avtab.htable, avtab.nslot, cur)
 
 static struct avtab_node *get_avtab_node(struct policydb *db,
                                          struct avtab_key *key,
@@ -136,12 +136,12 @@ static struct avtab_node *get_avtab_node(struct policydb *db,
         if (!node)
             return NULL;
 
+        // extra size: add_type() can grow policy without updating db->len
         int grow_size = sizeof(struct avtab_key);
         grow_size += sizeof(struct avtab_datum);
         if (key->specified & AVTAB_XPERMS) {
-            grow_size += sizeof(u8);
-            grow_size += sizeof(u8);
-            grow_size += sizeof(u32) * ARRAY_SIZE(avdatum.u.xperms->perms.p);
+            grow_size += sizeof(avdatum.u.xperms->specified) + sizeof(avdatum.u.xperms->driver) +
+                         sizeof(avdatum.u.xperms->perms.p);
         }
         db->len += grow_size;
     }
@@ -164,7 +164,9 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 {
     int i;
     int ret;
-    int shrink_size = sizeof(struct avtab_key) + sizeof(struct avtab_datum);
+    // https://github.com/torvalds/linux/blob/v6.1/security/selinux/ss/avtab.c#L619
+    int shrink_size = sizeof(node->key.source_type) + sizeof(node->key.target_type) + sizeof(node->key.target_class) +
+                      sizeof(node->key.specified);
     struct avtab removed = {};
     struct avtab_node *n;
     struct avtab_node *prev;
@@ -187,9 +189,13 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
             if (db->te_avtab.nel > 0)
                 db->te_avtab.nel--;
 
-            if ((n->key.specified & AVTAB_XPERMS) && n->datum.u.xperms) {
-                shrink_size += sizeof(u8) + sizeof(u8) + sizeof(u32) * ARRAY_SIZE(n->datum.u.xperms->perms.p);
-            }
+            if (n->key.specified & AVTAB_XPERMS)
+                // specified and driver are u8, perms.p holds 8 u32s
+                shrink_size += sizeof(n->datum.u.xperms->specified) + sizeof(n->datum.u.xperms->driver) +
+                               sizeof(n->datum.u.xperms->perms.p);
+            else
+                // data is u32
+                shrink_size += sizeof(n->datum.u.data);
             n->next = NULL;
             removed.htable[0] = n;
             removed.nel = 1;
@@ -416,15 +422,9 @@ static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src,
         }
         datum = &node->datum;
 
-        if (datum->u.xperms == NULL) {
-            datum->u.xperms = (struct avtab_extended_perms *)(kzalloc(
-                sizeof(xperms), GFP_KERNEL));
-            if (!datum->u.xperms) {
-                pr_err("alloc xperms failed\n");
-                return;
-            }
-            memcpy(datum->u.xperms, &xperms, sizeof(xperms));
-        }
+        // Allow updating permission bits of existing xperms
+        for (i = 0; i < ARRAY_SIZE(xperms.perms.p); i++)
+            datum->u.xperms->perms.p[i] |= xperms.perms.p[i];
     }
 }
 
@@ -958,10 +958,14 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
     void *data;
     struct policy_file fp;
 
-    len = old_pol->policydb.len;
+    // Some device policy db seems not marking type itself in type_attr_map_array
+    // policydb_read() adds each type to its own attribute map, so old_pol->policydb.len may be smaller
+    // preserve one ebitmap entry for this condition to avoid trigger -EINVAL
+    len = old_pol->policydb.len + (size_t)old_pol->policydb.p_types.nprim * (sizeof(u32) + sizeof(u64));
+
     data = vmalloc(len);
     if (!data) {
-        pr_err("alloc policy len %ld\n", len);
+        pr_err("alloc policy buffer len %zu\n", len);
         ret = -ENOMEM;
         goto out_free_data;
     }
@@ -974,7 +978,9 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
         pr_err("sepolicy: policydb_write: %d\n", ret);
         goto out_free_data;
     }
-
+    len -= fp.len;
+    // https://android.googlesource.com/kernel/common/+/35a7845718734ae638b85b420534cb859498dab6%5E%21
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
     // https://android-review.googlesource.com/c/kernel/common/+/3009995/11/security/selinux/ss/policydb.c
     // fixup config
     // 4*2+8+4
@@ -982,6 +988,7 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
     if (len >= kConfigOff + sizeof(u32)) {
         u32 *config_ptr = (u32 *)((unsigned long)data + kConfigOff);
         pr_info("old config: %u\n", *config_ptr);
+#ifdef POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
         if (old_pol->policydb.android_netlink_route) {
             pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE\n");
             *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
@@ -990,9 +997,10 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
             pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH\n");
             *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
         }
+#endif
         pr_info("new config: %u\n", *config_ptr);
     }
-
+#endif
     new_pol = kmemdup(old_pol, sizeof(*old_pol), GFP_KERNEL);
     if (!new_pol) {
         ret = -ENOMEM;
@@ -1010,7 +1018,7 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
         pr_err("sepolicy: policydb_read: %d\n", ret);
         goto out_free_policydb;
     }
-    new_pol->policydb.len = old_pol->policydb.len;
+    new_pol->policydb.len = len;
     kvfree(data);
 
     return new_pol;
@@ -1022,4 +1030,84 @@ out_free_data:
     kvfree(data);
 
     return ERR_PTR(ret);
+}
+
+#define KSU_SEPOL_SYNC_MAX_BUF   SZ_64M
+#define KSU_SEPOL_SYNC_SLACK     SZ_256K
+#define KSU_SEPOL_SYNC_MAX_TRIES 4
+
+/*
+ * Serialize the unpublished policydb and store the real size in
+ * policydb.len, which selinuxfs uses to size the policy read buffer.
+ * On failure db->len is left untouched.
+ */
+static int ksu_policydb_sync_len(struct policydb *db, const char *tag)
+{
+    const size_t tracked = db->len;
+    unsigned int attempt = 0;
+    size_t cap;
+    int ret = -EINVAL;
+
+    if (tracked + KSU_SEPOL_SYNC_SLACK > KSU_SEPOL_SYNC_MAX_BUF) {
+        pr_err("sepolicy: [%s] policydb.len %zu is too large to measure\n",
+               tag, tracked);
+        return -E2BIG;
+    }
+
+    cap = tracked + KSU_SEPOL_SYNC_SLACK;
+
+    while (attempt < KSU_SEPOL_SYNC_MAX_TRIES && cap <= KSU_SEPOL_SYNC_MAX_BUF) {
+        struct policy_file fp;
+        size_t remaining;
+        void *buf = vmalloc(cap);
+
+        if (!buf) {
+            pr_err("sepolicy: [%s] vmalloc(%zu) failed\n", tag, cap);
+            return -ENOMEM;
+        }
+
+        attempt++;
+        fp.data = buf;
+        fp.len = cap;
+        ret = policydb_write(db, &fp);
+        remaining = fp.len;
+        vfree(buf);
+
+        if (!ret) {
+            const size_t actual = cap - remaining;
+
+            ksu_dbg("sepolicy: [%s] len tracked=%zu actual=%zu delta=%zd attempts=%u buf=%zu\n",
+                    tag, tracked, actual,
+                    (ssize_t)actual - (ssize_t)tracked, attempt, cap);
+            db->len = actual;
+            return 0;
+        }
+
+        /* put_entry() returns -EINVAL when the buffer is exhausted */
+        if (ret != -EINVAL) {
+            pr_err("sepolicy: [%s] policydb_write failed: %d\n", tag, ret);
+            return ret;
+        }
+
+        ksu_dbg("sepolicy: [%s] buffer %zu too small (attempt %u)\n",
+                tag, cap, attempt);
+        cap *= 2;
+    }
+
+    pr_err("sepolicy: [%s] giving up after %u attempts (tracked=%zu): %d\n",
+           tag, attempt, tracked, ret);
+    return ret;
+}
+
+/* Best effort: if measuring fails, pad policydb.len instead. */
+int ksu_policydb_fixup_len(struct policydb *db, const char *tag)
+{
+    int ret = ksu_policydb_sync_len(db, tag);
+
+    if (ret) {
+        db->len += KSU_SEPOL_SYNC_SLACK;
+        pr_warn("sepolicy: [%s] could not measure policydb (%d), padded policydb.len by %zu to %zu\n",
+                tag, ret, (size_t)KSU_SEPOL_SYNC_SLACK, (size_t)db->len);
+    }
+    return ret;
 }
