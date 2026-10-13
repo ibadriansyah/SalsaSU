@@ -3,7 +3,7 @@
 ---
 
 <div align="center">
-  <img src="/assets/kernelsu_next.png" width="96" alt="KernelSU Next Logo">
+  <img src="/assets/salsasu.png" width="96" alt="KernelSU Next Logo">
 
   <h2>KernelSU Next</h2>
   <p><strong>A kernel-based root solution for Android devices.</strong></p>
